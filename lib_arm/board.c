@@ -44,6 +44,11 @@
 #include <devices.h>
 #include <version.h>
 #include <net.h>
+#include <asm/io.h>
+
+#if defined(CONFIG_BOOT_MOVINAND)
+#include <movi.h>
+#endif
 
 #ifdef CONFIG_DRIVER_SMC91111
 #include "../drivers/smc91111.h"
@@ -52,10 +57,19 @@
 #include "../drivers/lan91c96.h"
 #endif
 
+/* Note: volatile register variable is *NOT* volatile in gcc 4.5.1+ */
+#if	0
 DECLARE_GLOBAL_DATA_PTR;
+#else
+gd_t *gd;
+#endif
 
 #if (CONFIG_COMMANDS & CFG_CMD_NAND)
 void nand_init (void);
+#endif
+
+#ifdef CONFIG_ONENAND
+void onenand_init(void);
 #endif
 
 ulong monitor_flash_len;
@@ -94,8 +108,8 @@ void mem_malloc_init (ulong dest_addr)
 	mem_malloc_end = dest_addr + CFG_MALLOC_LEN;
 	mem_malloc_brk = mem_malloc_start;
 
-	memset ((void *) mem_malloc_start, 0,
-			mem_malloc_end - mem_malloc_start);
+	/* memset ((void *) mem_malloc_start, 0,
+			mem_malloc_end - mem_malloc_start); */
 }
 
 void *sbrk (ptrdiff_t increment)
@@ -135,6 +149,11 @@ static int display_banner (void)
 	printf ("\n\n%s\n\n", version_string);
 	debug ("U-Boot code: %08lX -> %08lX  BSS: -> %08lX\n",
 	       _armboot_start, _bss_start, _bss_end);
+#ifdef CONFIG_MEMORY_UPPER_CODE /* by scsuh */
+	debug("\t\bMalloc and Stack is above the U-Boot Code.\n");
+#else
+	debug("\t\bMalloc and Stack is below the U-Boot Code.\n");
+#endif
 #ifdef CONFIG_MODEM_SUPPORT
 	debug ("Modem Support enabled\n");
 #endif
@@ -170,7 +189,8 @@ static int display_dram_config (void)
 	for (i=0; i<CONFIG_NR_DRAM_BANKS; i++) {
 		size += gd->bd->bi_dram[i].size;
 	}
-	puts("DRAM:  ");
+
+	puts("DRAM:    ");
 	print_size(size, "\n");
 #endif
 
@@ -180,7 +200,7 @@ static int display_dram_config (void)
 #ifndef CFG_NO_FLASH
 static void display_flash_config (ulong size)
 {
-	puts ("Flash: ");
+	puts ("Flash:  ");
 	print_size (size, "\n");
 }
 #endif /* CFG_NO_FLASH */
@@ -240,12 +260,28 @@ void start_armboot (void)
 #ifndef CFG_NO_FLASH
 	ulong size;
 #endif
+
 #if defined(CONFIG_VFD) || defined(CONFIG_LCD)
 	unsigned long addr;
 #endif
 
+#if defined(CONFIG_BOOT_MOVINAND)
+	uint *magic = (uint *) (PHYS_SDRAM_1);
+#endif
+
 	/* Pointer is writable since we allocated a register for it */
+#ifdef CONFIG_MEMORY_UPPER_CODE /* by scsuh */
+	ulong gd_base;
+
+	gd_base = CFG_UBOOT_BASE + CFG_UBOOT_SIZE - CFG_MALLOC_LEN - CFG_STACK_SIZE - sizeof(gd_t);
+#ifdef CONFIG_USE_IRQ
+	gd_base -= (CONFIG_STACKSIZE_IRQ+CONFIG_STACKSIZE_FIQ);
+#endif
+	gd = (gd_t*)gd_base;
+#else
 	gd = (gd_t*)(_armboot_start - CFG_MALLOC_LEN - sizeof(gd_t));
+#endif
+
 	/* compiler optimization barrier needed for GCC >= 3.4 */
 	__asm__ __volatile__("": : :"memory");
 
@@ -294,11 +330,45 @@ void start_armboot (void)
 #endif /* CONFIG_LCD */
 
 	/* armboot_start is defined in the board-specific linker script */
+#ifdef CONFIG_MEMORY_UPPER_CODE /* by scsuh */
+	mem_malloc_init (CFG_UBOOT_BASE + CFG_UBOOT_SIZE - CFG_MALLOC_LEN - CFG_STACK_SIZE);
+#else
 	mem_malloc_init (_armboot_start - CFG_MALLOC_LEN);
+#endif
+
+#if defined(CONFIG_SMDK6400) || defined(CONFIG_SMDK6410) || defined(CONFIG_SMDK6430) || defined(CONFIG_SMDK2450) || defined(CONFIG_SMDK2416) || \
+defined(CONFIG_MINI6410)
+
+#if defined(CONFIG_NAND)
+	puts ("NAND:    ");
+	nand_init();		/* go init the NAND */
+	NAND_Init();
+#endif
+
+#if defined(CONFIG_ONENAND)
+	puts ("OneNAND: ");
+	onenand_init();		/* go init the One-NAND */
+#endif
+
+#if defined(CONFIG_BOOT_MOVINAND)
+	puts ("MMC:     ");
+
+	if ((0x24564236 == magic[0]) && (0x20764316 == magic[1])) {
+		printf("Boot up for burning\n");
+	} else {
+		movi_set_capacity();
+		movi_set_ofs(MOVI_TOTAL_BLKCNT);
+		movi_init();
+	}
+#endif
+
+#else
 
 #if (CONFIG_COMMANDS & CFG_CMD_NAND)
-	puts ("NAND:  ");
+	puts ("NAND:    ");
 	nand_init();		/* go init the NAND */
+#endif
+
 #endif
 
 #ifdef CONFIG_HAS_DATAFLASH
@@ -364,6 +434,13 @@ void start_armboot (void)
 	enable_interrupts ();
 
 	/* Perform network card initialisation if necessary */
+#if defined(CONFIG_DRIVER_DM9000) && defined(CONFIG_DRIVER_DM9000_NO_EEPROM)
+extern int eth_set_mac(bd_t * bd);
+	if (getenv ("ethaddr")) {
+		eth_set_mac(gd->bd);
+	}
+#endif
+
 #ifdef CONFIG_DRIVER_CS8900
 	cs8900_get_enetaddr (gd->bd->bi_enetaddr);
 #endif
@@ -389,7 +466,7 @@ void start_armboot (void)
 #endif
 #if (CONFIG_COMMANDS & CFG_CMD_NET)
 #if defined(CONFIG_NET_MULTI)
-	puts ("Net:   ");
+	puts ("Net:     ");
 #endif
 	eth_initialize(gd->bd);
 #endif

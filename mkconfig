@@ -23,9 +23,9 @@ done
 [ "${BOARD_NAME}" ] || BOARD_NAME="$1"
 
 [ $# -lt 4 ] && exit 1
-[ $# -gt 6 ] && exit 1
+[ $# -gt 8 ] && exit 1
 
-echo "Configuring for ${BOARD_NAME} board..."
+echo "Configuring for ${BOARD_NAME} board which boot from $7 $8..."
 
 #
 # Create link to architecture specific headers
@@ -56,9 +56,33 @@ else
 	ln -s ${LNPREFIX}arch-$6 asm-$2/arch
 fi
 
+# create link for s3c24xx SoC
+if [ "$3" = "s3c24xx" ] ; then
+	rm -f regs.h
+	ln -s $6.h regs.h
+	rm -f asm-$2/arch
+	ln -s arch-$3 asm-$2/arch
+fi
+
+# create link for s3c64xx SoC
+if [ "$3" = "s3c64xx" ] ; then
+	rm -f regs.h
+	ln -s $6.h regs.h
+	rm -f asm-$2/arch
+	ln -s arch-$3 asm-$2/arch
+fi
+
 if [ "$2" = "arm" ] ; then
 	rm -f asm-$2/proc
 	ln -s ${LNPREFIX}proc-armv asm-$2/proc
+fi
+
+# create link for s3c64xx-mp SoC
+if [ "$3" = "s3c64xx-mp" ] ; then
+	rm -f regs.h
+	ln -s $6.h regs.h
+	rm -f asm-$2/arch
+	ln -s arch-$3 asm-$2/arch
 fi
 
 #
@@ -82,6 +106,26 @@ else
 	> config.h		# Create new config file
 fi
 echo "/* Automatically generated - do not edit */" >>config.h
+case $7 in
+SD)
+	echo "#define FRIENDLYARM_BOOT_MEDIA_SD"   >> config.h
+	;;
+NAND)
+	echo "#define FRIENDLYARM_BOOT_MEDIA_NAND" >> config.h
+	;;
+*)
+	;;
+esac
+case $8 in
+ram128)
+	echo "#define FRIENDLYARM_BOOT_RAM128" >> config.h
+	;;
+ram256)
+	echo "#define FRIENDLYARM_BOOT_RAM256" >> config.h
+	;;
+*)
+	;;
+esac
 echo "#include <configs/$1.h>" >>config.h
 
 exit 0

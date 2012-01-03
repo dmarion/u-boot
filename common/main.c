@@ -39,7 +39,7 @@
 #endif
 
 #include <post.h>
-
+#include <1-wire.h>
 #ifdef CONFIG_SILENT_CONSOLE
 DECLARE_GLOBAL_DATA_PTR;
 #endif
@@ -326,6 +326,11 @@ void main_loop (void)
 	trab_vfd (bmp);
 #endif	/* CONFIG_VFD && VFD_TEST_LOGO */
 
+	{
+		void FriendlyARM1Wire(void);
+		FriendlyARM1Wire();
+	}
+
 #ifdef CONFIG_BOOTCOUNT_LIMIT
 	bootcount = bootcount_load();
 	bootcount++;
@@ -443,6 +448,7 @@ void main_loop (void)
 	}
 #endif
 
+	FriendlyARMMenu();
 	/*
 	 * Main Loop for Monitor Command Processing
 	 */
@@ -1399,3 +1405,227 @@ int do_run (cmd_tbl_t * cmdtp, int flag, int argc, char *argv[])
 	return 0;
 }
 #endif	/* CFG_CMD_RUN */
+
+static void ExecuteCmd(char *cmd)
+{
+	parse_string_outer(cmd, FLAG_PARSE_SEMICOLON | FLAG_EXIT_FROM_LOOP);
+}
+
+#define RELEASE_MARK "2011-10"
+
+#if defined(FRIENDLYARM_BOOT_MEDIA_NAND)
+#define BOOT_MEDIA "NAND"
+#elif defined(FRIENDLYARM_BOOT_MEDIA_SD)
+#define BOOT_MEDIA "SD"
+#endif
+
+#define K *1024
+#define M K K
+
+static unsigned char Lcd;
+static unsigned short FirmwareVer;
+
+void FriendlyARM1Wire(void)
+{
+	InitOneWire();
+	if (!GetInfo(&Lcd, &FirmwareVer)) {
+		Lcd = 0;
+		FirmwareVer = 0;
+	} else {
+		SetBacklightOfLCD(0);
+	}
+}
+
+static void SetLinuxCommandLine(const char *cmdline);
+void FriendlyARMMenu(void)
+{
+	while(1) {
+		int c;
+		printf("##### FriendlyARM U-Boot(" RELEASE_MARK ", " BOOT_MEDIA ") for 6410 #####\n");
+		printf("[f] Format the nand flash\n");
+		printf("[v] Download u-boot.bin\n");
+		printf("[k] Download Linux/Android kernel\n");
+		printf("[y] Download root yaffs2 image\n");
+		printf("[u] Download root ubifs image\n");
+		printf("[a] Download Absolute User Application\n");
+		printf("[n] Download Nboot.nb0 for WinCE\n");
+		printf("[w] Download WinCE NK.nb0\n");
+		printf("[s] Set the boot parameter of Linux\n");
+		printf("[b] Boot Linux\n");
+		printf("[q] Quit to shell\n");
+		printf("NAND(%s): %u MiB, RAM: %u MiB\n", NandIsMlc2() ? "MLC2" : (NandIsMlc1()? "MLC1" : "SLC"), FriendlyARMGetNandSizeInMB(), PHYS_SDRAM_1_SIZE >> 20);
+		if (Lcd != 0) {
+			printf("LCD type, firmware version: %u %u\n", Lcd, FirmwareVer);
+		}
+		printf("Enter your Selection:");
+
+		c = getc();
+		printf("%c\n", c >= ' ' && c <= 127 ? c : ' ');
+
+		switch(c) {
+			unsigned max_size, pos, len;
+		case 'F': case 'f':
+			FriendlyARMFormatFrom(0, 1);
+			break;
+
+		case 'V': case 'v':
+			pos = 0;
+			max_size = 256 K;
+			len = 256 K;
+			FriendlyARMGetDataFromUsbAndWriteNand(max_size, pos, len, "U-Boot.bin");
+			SetLinuxCommandLine(NULL);
+			break;
+
+		case 'K': case 'k':
+			if (NandIsMlc()) {
+				pos =  4 M;
+				max_size = 5 M - 128 K;
+				len = 8 M;
+				NAND_EraseBlock(1 M / NandBlockSizeInByte);
+			} else {
+				pos = 4 * 128 K;
+				max_size = 5 M - 128 K;
+				len = 5 M;
+			}
+			FriendlyARMGetDataFromUsbAndWriteNand(max_size, pos, len, "Linux/Android Kernel");
+			break;
+
+		case 'Y': case 'y':
+			if (NandIsMlc()) {
+				printf("Yaffs is not support yet for MLC2 NAND\n");
+			} else {
+				FriendlyARMGetDataFromUsbAndWriteNand(126 M, 5 M + 4 * 128 K, (unsigned)-1, "yaffs2-image");
+				SetLinuxCommandLine("root=/dev/mtdblock2 console=ttySAC0,115200");
+			}
+			break;
+
+		case 'U': case 'u':
+			max_size = 126 M;
+			len = (unsigned) -2;
+			if (NandIsMlc()) {
+				pos = 12 M;
+			} else {
+				pos = 5 M + 4 * 128 K;
+			}
+			FriendlyARMGetDataFromUsbAndWriteNand(max_size, pos, len, "ubifs-image");
+			SetLinuxCommandLine("init=/linuxrc rootfstype=ubifs root=ubi0:FriendlyARM-root ubi.mtd=2 console=ttySAC0,115200");
+			break;
+
+		case 'A': case 'a':
+			FriendlyARMGetDataFromUsbAndWriteNand(64 M, 0, 128 M, "User-Bin");
+			break;
+
+		case 'N': case 'n':
+			FriendlyARMGetDataFromUsbAndWriteNand(128 K, 0, 128 K, "nboot.nb0");
+			break;
+
+		case 'W': case 'w':
+			if (NandIsMlc()) {
+				max_size = 63 M;
+				pos =  8 M;
+				len = 72 M;
+				FriendlyARMFormatFrom( pos / NandBlockSizeInByte, 0);
+			} else {
+				max_size = 63 M;
+				pos = 2 M + 4 * 128 K;
+				len = 64 M;
+				ExecuteCmd("nand erase 4280000");
+			}
+			FriendlyARMGetDataFromUsbAndWriteNand(max_size, pos, len, "NK.nb0");
+			// Mark the indicators of NK Magic Number and Image Size
+			{
+				unsigned char *p = (unsigned char *)0xC0000000;
+				memset(p, 0, 128 K);
+				((unsigned *)p)[0] = 0xCEFA4146U;
+				((unsigned *)p)[1] = 63 M;
+				
+				if (NandIsMlc()) {
+					pos = 1 M;
+					len = 2 M;
+				} else {
+					pos = 2 * NandBlockSizeInByte;
+					len = 1 * NandBlockSizeInByte;
+				}
+
+				FriendlyARMWriteNand(p, 128 K, pos, len);
+			}
+			break;
+
+		case 'S': case 's':
+			{
+				int r;
+				r = readline("Linux cmd line: ");
+				if (r > 0 && r < 1000) {
+					SetLinuxCommandLine(console_buffer);
+				} else {
+					printf("Linux command line not changed\n");
+				}
+			}
+			break;
+		case 'B': case 'b': 
+			if (NandIsMlc()) {
+				ExecuteCmd("nand read.i c0008000 400000 500000;bootm c0008000");
+			} else {
+				ExecuteCmd(CONFIG_BOOTCOMMAND);
+			}
+			while(1);
+		case 'Q': case 'q':
+			if (NandIsMlc()) {
+				//printf("Caution: any nand write command may damage your data. DON'T use them\n");
+			}
+			return;
+		default:
+			;
+		}
+	}
+}
+
+#undef K
+#undef M
+
+extern int FriendlyARMGetDataFromUSB (unsigned max_len, unsigned char **data_ptr, unsigned *received_len);
+extern int FriendlyARMWriteNand(const unsigned char*data, unsigned len, unsigned offset, unsigned MaxNandSize);
+int FriendlyARMGetDataFromUsbAndWriteNand(unsigned max_len, unsigned offset, unsigned MaxNandSize, const char *Name)
+{
+	int ret;
+	unsigned char *RevPtr;
+	unsigned RevLen;
+	printf("Downloading %s from USB...\n", Name);
+	ret = FriendlyARMGetDataFromUSB(max_len, &RevPtr, &RevLen);
+	printf("Downloading %s %s\n", Name, ret >= 0 ? "successed" : "failed");
+	if (ret < 0) {
+		return ret;
+	}
+	ret = FriendlyARMCheckData(RevPtr, RevLen, offset, MaxNandSize);
+	if (ret < 0) {
+		return ret;
+	}
+	printf("Writing %s into NAND...\n", Name);
+	if (NandIsMlc() && offset == 0) {
+		ret = FriendlyARMWriteNandMlcBoot(RevPtr, RevLen, 1);
+	} else {
+		ret = FriendlyARMWriteNand(RevPtr, RevLen, offset, MaxNandSize);
+	}
+	printf("Writing %s %s\n", Name, ret >= 0 ? "successed" : "failed");
+	
+	return ret;
+}
+
+static void SetLinuxCommandLine(const char *cmdline)
+{
+	static char buf[1024 + 1] = "setenv bootargs ";
+	if (cmdline == NULL) {
+		cmdline = getenv("bootargs");
+	}
+	strcpy(buf + 16, cmdline);
+	parse_string_outer(buf, FLAG_PARSE_SEMICOLON | FLAG_EXIT_FROM_LOOP);
+	if (NandIsMlc()) {
+		char *tmp = getenv("bootcmd");
+		if (tmp != NULL && strstr(tmp, "nand read.i c0008000 80000")  != NULL) {
+			setenv("bootcmd", "nand read.i c0008000 400000 500000;bootm c0008000");
+		}
+	}
+	parse_string_outer("saveenv", FLAG_PARSE_SEMICOLON | FLAG_EXIT_FROM_LOOP);
+	printf("Linux command line '%s' saved\n", buf+16);
+}
+

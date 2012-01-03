@@ -70,7 +70,9 @@ uchar default_environment[] = {
 	"bootargs="	CONFIG_BOOTARGS			"\0"
 #endif
 #ifdef	CONFIG_BOOTCOMMAND
+#if !defined(CONFIG_BOOT_MOVINAND)
 	"bootcmd="	CONFIG_BOOTCOMMAND		"\0"
+#endif
 #endif
 #ifdef	CONFIG_RAMBOOTCOMMAND
 	"ramboot="	CONFIG_RAMBOOTCOMMAND		"\0"
@@ -141,7 +143,7 @@ uchar default_environment[] = {
 	"\0"
 };
 
-#if defined(CFG_ENV_IS_IN_NAND)		/* Environment is in Nand Flash */
+#if defined(CFG_ENV_IS_IN_NAND) || defined(CFG_ENV_IS_IN_MOVINAND) || defined(CFG_ENV_IS_IN_ONENAND) /* Environment is in Nand Flash or MoviNAND or OneNAND */
 int default_environment_size = sizeof(default_environment);
 #endif
 

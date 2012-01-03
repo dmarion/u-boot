@@ -52,25 +52,35 @@ static int nand_dump_oob(nand_info_t *nand, ulong off)
 	return 0;
 }
 
-static int nand_dump(nand_info_t *nand, ulong off)
+static int nand_dump_mlc(ulong off)
 {
 	int i;
 	u_char *buf, *p;
+	unsigned int block, page;
+	extern int NAND_ReadSectorWithOOB(unsigned block, unsigned sector, unsigned char *buffer, unsigned char *oob);
 
-	buf = malloc(nand->oobblock + nand->oobsize);
+	if (off % NandPageSizeInByte != 0) {
+		puts("offset should be multiple of page size\n");
+		return -1;
+	}
+	
+	buf = malloc(NandPageSizeInByte + NandOobSize);
+	
 	if (!buf) {
 		puts("No memory for page buffer\n");
 		return 1;
 	}
-	off &= ~(nand->oobblock - 1);
-	i = nand_read_raw(nand, buf, off, nand->oobblock, nand->oobsize);
-	if (i < 0) {
-		printf("Error (%d) reading page %08x\n", i, off);
-		free(buf);
-		return 1;
-	}
+
+	page = (off % NandBlockSizeInByte) / NandPageSizeInByte;
+	block = off / NandBlockSizeInByte;
+
+	NAND_ReadSectorWithOOB(block, page, buf, buf + NandPageSizeInByte);
+
 	printf("Page %08x dump:\n", off);
-	i = nand->oobblock >> 4; p = buf;
+
+	i = NandPageSizeInByte >> 4;
+	p = buf;
+
 	while (i--) {
 		printf( "\t%02x %02x %02x %02x %02x %02x %02x %02x"
 			"  %02x %02x %02x %02x %02x %02x %02x %02x\n",
@@ -78,13 +88,18 @@ static int nand_dump(nand_info_t *nand, ulong off)
 			p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
 		p += 16;
 	}
+
 	puts("OOB:\n");
-	i = nand->oobsize >> 3;
+
+	p = buf + NandPageSizeInByte;
+	i = NandOobSize >> 3;
+
 	while (i--) {
 		printf( "\t%02x %02x %02x %02x %02x %02x %02x %02x\n",
 			p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
 		p += 8;
 	}
+
 	free(buf);
 
 	return 0;
@@ -163,6 +178,264 @@ out:
 	return 0;
 }
 
+unsigned int FriendlyARMGetNandSizeInMB(void)
+{
+	nand_info_t *nand;
+	if (nand_curr_device < 0 || nand_curr_device >= CFG_MAX_NAND_DEVICE ||
+	    !nand_info[nand_curr_device].name) {
+		return 0;
+	}
+	nand = &nand_info[nand_curr_device];
+	return 1<<(NandSizeInByteShift - 20);
+}
+
+int FriendlyARMReadNand(unsigned char *data, unsigned len, unsigned offset)
+{
+	unsigned block;
+	unsigned page;
+	unsigned count;
+	unsigned last_block = (1<<(NandSizeInByteShift - NandBlockSizeInByteShift)) - 1;
+
+	unsigned checked_block = (unsigned)-1;
+
+	if (offset % NandPageSizeInByte != 0) {
+		return -1;
+	}
+	block = offset / NandBlockSizeInByte;
+	page =  (offset % NandBlockSizeInByte) / NandPageSizeInByte;
+	for (count = 0; count < len; count += NandPageSizeInByte) {
+		if (checked_block != block) {
+			// found a good block
+			for(;;) {
+				if (block > last_block) {
+					return -2;
+				}
+				if (NAND_CheckBlock(block)) {
+					checked_block = block;
+					break;
+				}
+				block++;
+			}
+		}
+		if (!NAND_ReadPage(block, page, data + count) ) {
+			return -4;
+		}
+		page++;
+		if (page >= NandBlockSizeInByte/NandPageSizeInByte) {
+			page = 0;
+			block++;
+			printf(".");
+		}
+	}
+	return 0;
+}
+
+int FriendlyARMFormat(int StartBlock, int EndBlock, int lowformat)
+{
+	int i;
+	int OK;
+	
+	for (i = StartBlock; i <= EndBlock; i++) {
+		if (!NAND_CheckBlock(i)) {
+			if (lowformat) {
+				NAND_EraseBlock(i);
+			}
+		} else {
+			OK = NAND_EraseBlock(i);
+			if (!OK) {
+				return -1;
+			}
+		}
+	}
+
+	return 0;
+}
+
+int FriendlyARMFormatFrom(int StartBlock, int lowformat)
+{
+	int LastBlock = (1 << (NandSizeInByteShift - NandBlockSizeInByteShift)) - 1;
+	int ret = FriendlyARMFormat(StartBlock, LastBlock, lowformat);
+	return ret;
+}
+
+#if !defined(YaffsImageOobSizePerPage)
+#define YaffsImageOobSizePerPage 64
+#endif
+
+static int WriteOneBlock(unsigned char *buffer, unsigned int size, int StartBlock, int EndBlock, int *ResultBlock, int WithOOB)
+{
+	int i;
+Top:
+
+	// found a good block
+	for (;;) {
+		if (StartBlock > EndBlock) {
+			return 0;
+		}
+		if (NAND_CheckBlock(StartBlock)) {
+			break;
+		}
+		printf("Skip block 0x%x\n", StartBlock);
+		StartBlock++;
+	}
+	*ResultBlock = StartBlock;
+	
+	for (i = 0; i < 10; i++) {
+		int OK = 0;
+		unsigned s;
+		unsigned Step = WithOOB ? (NandPageSizeInByte + YaffsImageOobSizePerPage) : NandPageSizeInByte;
+		
+		// write each sector
+		for (s = 0; s < size; s += Step) {
+			unsigned sector = s / Step;
+			unsigned char *data = buffer + s;
+
+			static unsigned char write_oob[640];
+			
+			if (!WithOOB) {
+				memset(write_oob, 0xFF, sizeof write_oob);
+			} else {
+				memcpy(write_oob, data + NandPageSizeInByte, sizeof write_oob);
+			}
+			
+			OK = NAND_WriteSectorWithOOB(StartBlock, sector, data, write_oob);
+			if (!OK) {
+				break;
+			}
+		}
+		if (OK) {
+			return 1;
+		}
+		//
+		printf("write block 0x%x error, erase and try again\n", StartBlock);
+		NAND_EraseBlock(StartBlock);
+	}
+	printf("mark block 0x%x bad\n", StartBlock);
+	NAND_MarkBlockBad(StartBlock);
+	goto Top;
+	
+	return 0;
+}
+
+static int FriendlyARMWriteNandMlc2(unsigned char *data, unsigned len, unsigned offset, unsigned MaxNandSize)
+{
+	int IsYaffs = 0;
+	int EndBlock;
+	int block;
+	int Step;
+	unsigned int i;
+	int OK = 1;
+
+	if (offset % NandBlockSizeInByte != 0) {
+		return -1;
+	}
+	
+	block = offset / NandBlockSizeInByte;
+
+	if (MaxNandSize == (unsigned)(-1)) {
+		if (NandIsMlc()) {
+			// not support MLC Yaffs
+			return -2;
+		}
+		IsYaffs = 1;
+		MaxNandSize = (1 << NandSizeInByteShift) - offset;
+	}
+	if (MaxNandSize == (unsigned)(-2)) { // UBIFS
+		MaxNandSize = (1 << NandSizeInByteShift) - offset;
+	}
+	Step = NandBlockSizeInByte;
+	EndBlock = (offset + MaxNandSize + NandBlockSizeInByte - 1) / (NandBlockSizeInByte) - 1;
+	len = ( len + NandPageSizeInByte - 1) / NandPageSizeInByte * NandPageSizeInByte;
+	
+	FriendlyARMFormat(block, EndBlock, 0);
+	
+	for (i = 0; i < len; i += Step) {
+		unsigned int size;
+
+		size = len - i;
+		if (size > Step) {
+			size = Step;
+		}
+		
+		OK = WriteOneBlock(data + i, size, block, EndBlock, &block, IsYaffs);
+		if (!OK) {
+			return -3;
+		}
+		block++;
+	}
+	
+	return 0;
+}
+
+int FriendlyARMWriteNand(const unsigned char*data, unsigned len, unsigned offset, unsigned MaxNandSize)
+{
+	nand_info_t *nand;
+	int ret;
+	int i;
+	int IsYaffs;
+
+	if (NandIsMlc()) {
+		ret = FriendlyARMWriteNandMlc2((unsigned char *)data, len, offset, MaxNandSize);
+		return ret;
+	}
+	IsYaffs = MaxNandSize == (unsigned)(-1);
+
+	if (nand_curr_device < 0 || nand_curr_device >= CFG_MAX_NAND_DEVICE ||
+	    !nand_info[nand_curr_device].name) {
+		printf("\nno devices available\n");
+		return -1;
+	}
+	nand = &nand_info[nand_curr_device];
+	if (offset % (128 * 1024) != 0) {
+		return -2;
+	}
+
+	if (IsYaffs) {
+		if (len % (2048 + 64) != 0) {
+			return -5;
+		}
+		MaxNandSize = nand->size - offset;
+	} else {
+		len = ((len - 1) / (128 * 1024) + 1) * (128 * 1024);
+	}
+
+	// try 3 times
+	for (i = 0; i < 3; i++) {
+		nand_erase_options_t e_opts;
+		nand_write_options_t w_opts;
+
+		// erase
+		memset(&e_opts, 0, sizeof e_opts);
+		e_opts.offset = offset;
+		e_opts.length = MaxNandSize;
+		ret = nand_erase_opts(nand, &e_opts);
+		ret = 0;
+		if (ret != 0) {
+			ret = -3;
+			continue;
+		}
+
+		// write
+		memset(&w_opts, 0, sizeof(w_opts));
+		w_opts.buffer	  = (unsigned char *)data ;
+		w_opts.length	  = len;
+		w_opts.offset	  = offset;
+		w_opts.blockalign = 1;
+		w_opts.pad 	  = ! IsYaffs;
+		w_opts.autoplace  = !!IsYaffs;
+		w_opts.writeoob   = !!IsYaffs;
+		ret = nand_write_opts(nand, &w_opts);
+		if (ret != 0) {
+			ret = -4;
+			continue;
+		}
+
+		// passed, go away
+		break;
+	}
+	return ret;
+}
+
 int do_nand(cmd_tbl_t * cmdtp, int flag, int argc, char *argv[])
 {
 	int i, dev, ret;
@@ -188,7 +461,7 @@ int do_nand(cmd_tbl_t * cmdtp, int flag, int argc, char *argv[])
 			if (nand_info[i].name)
 				printf("Device %d: %s, sector size %lu KiB\n",
 					i, nand_info[i].name,
-					nand_info[i].erasesize >> 10);
+					NandBlockSizeInByte >> 10);
 		}
 		return 0;
 	}
@@ -241,9 +514,20 @@ int do_nand(cmd_tbl_t * cmdtp, int flag, int argc, char *argv[])
 
 	if (strcmp(cmd, "bad") == 0) {
 		printf("\nDevice %d bad blocks:\n", nand_curr_device);
-		for (off = 0; off < nand->size; off += nand->erasesize)
-			if (nand_block_isbad(nand, off))
-				printf("  %08x\n", off);
+		if (NandIsMlc()) {
+			unsigned int block_num = (1<<(NandSizeInByteShift - NandBlockSizeInByteShift));
+			unsigned int i;
+			for (i = 0; i < block_num; i++) {
+				if (!NAND_CheckBlock(i)) {
+					printf("  %08X\n", i<<NandBlockSizeInByteShift);
+				}
+			}
+		
+		} else {
+			for (off = 0; off < nand->size; off += nand->erasesize)
+				if (nand_block_isbad(nand, off))
+					printf("  %08x\n", off);
+		}
 		return 0;
 	}
 
@@ -290,7 +574,16 @@ int do_nand(cmd_tbl_t * cmdtp, int flag, int argc, char *argv[])
 				return -1;
 			}
 		}
-		ret = nand_erase_opts(nand, &opts);
+		if (NandIsMlc()) {
+			printf("off size: %08X %08X\n", off, size);
+			if (off % NandBlockSizeInByte != 0 || size % NandBlockSizeInByte != 0) {
+				puts("offset and size should be multiple of block size\n");
+				ret = -1;
+			} else {
+				ret = FriendlyARMFormat(off / NandBlockSizeInByte, off / NandBlockSizeInByte + size / NandBlockSizeInByte - 1, scrub);
+			}
+		} else 
+			ret = nand_erase_opts(nand, &opts);
 		printf("%s\n", ret ? "ERROR" : "OK");
 
 		return ret == 0 ? 0 : 1;
@@ -305,8 +598,9 @@ int do_nand(cmd_tbl_t * cmdtp, int flag, int argc, char *argv[])
 
 		if (s != NULL && strcmp(s, ".oob") == 0)
 			ret = nand_dump_oob(nand, off);
-		else
-			ret = nand_dump(nand, off);
+		else {
+			ret = nand_dump_mlc(off);
+		}
 
 		return ret == 0 ? 1 : 0;
 
@@ -330,14 +624,10 @@ int do_nand(cmd_tbl_t * cmdtp, int flag, int argc, char *argv[])
 		if (s != NULL &&
 		    (!strcmp(s, ".jffs2") || !strcmp(s, ".e") || !strcmp(s, ".i"))) {
 			if (read) {
-				/* read */
-				nand_read_options_t opts;
-				memset(&opts, 0, sizeof(opts));
-				opts.buffer	= (u_char*) addr;
-				opts.length	= size;
-				opts.offset	= off;
-				opts.quiet      = quiet;
-				ret = nand_read_opts(nand, &opts);
+				ret = FriendlyARMReadNand( (u_char*)addr, size, off);
+				if (ret == -1) {
+					puts("offset should be multiple of page size\n");
+				}
 			} else {
 				/* write */
 				nand_write_options_t opts;
@@ -349,13 +639,67 @@ int do_nand(cmd_tbl_t * cmdtp, int flag, int argc, char *argv[])
 				opts.pad	= 1;
 				opts.blockalign = 1;
 				opts.quiet      = quiet;
-				ret = nand_write_opts(nand, &opts);
+				if (NandIsMlc()) {
+					ret = -1;
+					puts("write.jffs2/write.e/write.i is not supported\n");
+				} else
+					ret = nand_write_opts(nand, &opts);
 			}
-		} else {
-			if (read)
-				ret = nand_read(nand, off, &size, (u_char *)addr);
-			else
-				ret = nand_write(nand, off, &size, (u_char *)addr);
+#ifdef CFG_NAND_YAFFS_WRITE
+		} else if (!read && s != NULL && + (!strcmp(s, ".yaffs") || !strcmp(s, ".yaffs1"))) {
+			nand_write_options_t opts;
+ 			memset(&opts, 0, sizeof(opts));
+ 			opts.buffer = (u_char*) addr;
+ 			opts.length = size;
+ 			opts.offset = off;
+ 			opts.pad = 0;
+ 			opts.blockalign = 1;
+ 			opts.quiet = quiet;
+ 			opts.writeoob = 1;
+ 			opts.autoplace = 1;
+
+			/* jsgood */
+ 			/* if (s[6] == '1')
+				opts.forceyaffs = 1; */
+
+ 			ret = nand_write_opts(nand, &opts);
+#endif
+ 		} else {
+			if (read) {
+				if (!NandIsMlc()) {
+					ret = nand_read(nand, off, &size, (u_char *)addr);
+				} else {
+					ret = FriendlyARMReadNand( (u_char*)addr, size, off);
+					if (ret == -1) {
+						puts("offset should be multiple of page size\n");
+					}
+				}
+			} else {
+				if (NandIsMlc()) {
+					if (off % NandBlockSizeInByte != 0) {
+						puts("offset should be multiple of block size\n");
+						ret = -1;
+					} else {
+						unsigned int i;
+						ret = 0;
+						for (i = 0; i < size; i += NandBlockSizeInByte) {
+							int len = size - i;
+							if (len > NandBlockSizeInByte) {
+								len = NandBlockSizeInByte;
+							}
+							FriendlyARMWriteNand(((u_char *)addr) + i, len, off + i, NandBlockSizeInByte);
+						}
+					}
+				} else {
+					ret = nand_write(nand, off, &size, (u_char *)addr);
+
+					if (ret == 0) {
+						uint *magic = (uint*)(PHYS_SDRAM_1);
+						if ((0x24564236 == magic[0]) && (0x20764316 == magic[1]))
+							magic[0] = 0x27051956;
+					}
+				}
+			}
 		}
 
 		printf(" %d bytes %s: %s\n", size,
@@ -365,6 +709,10 @@ int do_nand(cmd_tbl_t * cmdtp, int flag, int argc, char *argv[])
 	}
 
 	if (strcmp(cmd, "markbad") == 0) {
+		if (NandIsMlc()) {
+			printf("nand markbad is not supported\n");
+			return 1;
+		}
 		addr = (ulong)simple_strtoul(argv[2], NULL, 16);
 
 		int ret = nand->block_markbad(nand, addr);
@@ -386,6 +734,12 @@ int do_nand(cmd_tbl_t * cmdtp, int flag, int argc, char *argv[])
 	if (strcmp(cmd, "lock") == 0) {
 		int tight  = 0;
 		int status = 0;
+
+		if (NandIsMlc()) {
+			printf("nand lock is not supported\n");
+			return 1;
+		}
+
 		if (argc == 3) {
 			if (!strcmp("tight", argv[2]))
 				tight = 1;
@@ -405,19 +759,19 @@ int do_nand(cmd_tbl_t * cmdtp, int flag, int argc, char *argv[])
 			       (nand_chip->read_byte(nand) & 0x80 ?
 				"NOT " : "" ) );
 
-			for (off = 0; off < nand->size; off += nand->oobblock) {
+			for (off = 0; off < nand->size; off += nand->writesize) {
 				int s = nand_get_lock_status(nand, off);
 
 				/* print message only if status has changed
 				 * or at end of chip
 				 */
-				if (off == nand->size - nand->oobblock
+				if (off == nand->size - nand->writesize
 				    || (s != last_status && off != 0))	{
 
 					printf("%08x - %08x: %8d pages %s%s%s\n",
 					       block_start,
 					       off-1,
-					       (off-block_start)/nand->oobblock,
+					       (off-block_start)/nand->writesize,
 					       ((last_status & NAND_LOCK_STATUS_TIGHT) ? "TIGHT " : ""),
 					       ((last_status & NAND_LOCK_STATUS_LOCK) ? "LOCK " : ""),
 					       ((last_status & NAND_LOCK_STATUS_UNLOCK) ? "UNLOCK " : ""));
@@ -457,12 +811,16 @@ usage:
 
 U_BOOT_CMD(nand, 5, 1, do_nand,
 	"nand    - NAND sub-system\n",
-	"info                  - show available NAND devices\n"
+	"info             - show available NAND devices\n"
 	"nand device [dev]     - show or set current device\n"
 	"nand read[.jffs2]     - addr off|partition size\n"
 	"nand write[.jffs2]    - addr off|partiton size - read/write `size' bytes starting\n"
 	"    at offset `off' to/from memory address `addr'\n"
-	"nand erase [clean] [off size] - erase `size' bytes from\n"
+#ifdef CFG_NAND_YAFFS_WRITE
+	"nand write[.yaffs[1]] - addr off|partition size - write `size' byte yaffs image\n"
+	"    starting at offset `off' from memory address `addr' (.yaffs1 for 512+16 NAND)\n"
+#endif
+ 	"nand erase [clean] [off size] - erase `size' bytes from\n"
 	"    offset `off' (entire device if not specified)\n"
 	"nand bad - show bad blocks\n"
 	"nand dump[.oob] off - dump page\n"
@@ -482,7 +840,7 @@ static int nand_load_image(cmd_tbl_t *cmdtp, nand_info_t *nand,
 
 	printf("\nLoading from %s, offset 0x%lx\n", nand->name, offset);
 
-	cnt = nand->oobblock;
+	cnt = nand->writesize;
 	r = nand_read(nand, offset, &cnt, (u_char *) addr);
 	if (r) {
 		puts("** Read error\n");
