@@ -44,6 +44,9 @@
 #include <devices.h>
 #include <version.h>
 #include <net.h>
+#include <asm/io.h>
+#include <movi.h>
+#include <regs.h>
 
 #ifdef CONFIG_DRIVER_SMC91111
 #include "../drivers/smc91111.h"
@@ -54,9 +57,8 @@
 
 DECLARE_GLOBAL_DATA_PTR;
 
-#if (CONFIG_COMMANDS & CFG_CMD_NAND)
 void nand_init (void);
-#endif
+void onenand_init(void);
 
 ulong monitor_flash_len;
 
@@ -94,8 +96,8 @@ void mem_malloc_init (ulong dest_addr)
 	mem_malloc_end = dest_addr + CFG_MALLOC_LEN;
 	mem_malloc_brk = mem_malloc_start;
 
-	memset ((void *) mem_malloc_start, 0,
-			mem_malloc_end - mem_malloc_start);
+	/* memset ((void *) mem_malloc_start, 0,
+			mem_malloc_end - mem_malloc_start); */
 }
 
 void *sbrk (ptrdiff_t increment)
@@ -135,6 +137,11 @@ static int display_banner (void)
 	printf ("\n\n%s\n\n", version_string);
 	debug ("U-Boot code: %08lX -> %08lX  BSS: -> %08lX\n",
 	       _armboot_start, _bss_start, _bss_end);
+#ifdef CONFIG_MEMORY_UPPER_CODE /* by scsuh */
+	debug("\t\bMalloc and Stack is above the U-Boot Code.\n");
+#else
+	debug("\t\bMalloc and Stack is below the U-Boot Code.\n");
+#endif
 #ifdef CONFIG_MODEM_SUPPORT
 	debug ("Modem Support enabled\n");
 #endif
@@ -170,7 +177,8 @@ static int display_dram_config (void)
 	for (i=0; i<CONFIG_NR_DRAM_BANKS; i++) {
 		size += gd->bd->bi_dram[i].size;
 	}
-	puts("DRAM:  ");
+
+	puts("DRAM:    ");
 	print_size(size, "\n");
 #endif
 
@@ -180,7 +188,7 @@ static int display_dram_config (void)
 #ifndef CFG_NO_FLASH
 static void display_flash_config (ulong size)
 {
-	puts ("Flash: ");
+	puts ("Flash:  ");
 	print_size (size, "\n");
 }
 #endif /* CFG_NO_FLASH */
@@ -240,12 +248,28 @@ void start_armboot (void)
 #ifndef CFG_NO_FLASH
 	ulong size;
 #endif
+
 #if defined(CONFIG_VFD) || defined(CONFIG_LCD)
 	unsigned long addr;
 #endif
 
+#if defined(CONFIG_BOOT_MOVINAND)
+	uint *magic = (uint *) (PHYS_SDRAM_1);
+#endif
+
 	/* Pointer is writable since we allocated a register for it */
+#ifdef CONFIG_MEMORY_UPPER_CODE /* by scsuh */
+	ulong gd_base;
+
+	gd_base = CFG_UBOOT_BASE + CFG_UBOOT_SIZE - CFG_MALLOC_LEN - CFG_STACK_SIZE - sizeof(gd_t);
+#ifdef CONFIG_USE_IRQ
+	gd_base -= (CONFIG_STACKSIZE_IRQ+CONFIG_STACKSIZE_FIQ);
+#endif
+	gd = (gd_t*)gd_base;
+#else
 	gd = (gd_t*)(_armboot_start - CFG_MALLOC_LEN - sizeof(gd_t));
+#endif
+
 	/* compiler optimization barrier needed for GCC >= 3.4 */
 	__asm__ __volatile__("": : :"memory");
 
@@ -294,11 +318,68 @@ void start_armboot (void)
 #endif /* CONFIG_LCD */
 
 	/* armboot_start is defined in the board-specific linker script */
+#ifdef CONFIG_MEMORY_UPPER_CODE /* by scsuh */
+	mem_malloc_init (CFG_UBOOT_BASE + CFG_UBOOT_SIZE - CFG_MALLOC_LEN - CFG_STACK_SIZE);
+#else
 	mem_malloc_init (_armboot_start - CFG_MALLOC_LEN);
+#endif
+
+/* samsung socs: auto-detect devices */
+#if defined(CONFIG_SMDK6410) || defined(CONFIG_SMDK6430)
+
+	/* SD/MMC detecting is on as default */
+	puts("SD/MMC:  ");
+	movi_set_capacity();
+	movi_set_ofs(MOVI_TOTAL_BLKCNT);
+	movi_init();
+
+	if (INF_REG3_REG == 1) {
+		puts("OneNAND: ");
+		onenand_init();
+		setenv("bootcmd", "onenand read c0008000 40000 3c0000;bootm c0008000");
+	} else {
+		puts("NAND:    ");
+		nand_init();
+
+		if (INF_REG3_REG == 0 || INF_REG3_REG == 7)
+			setenv("bootcmd", "movi read kernel c0008000;movi read rootfs c0800000;bootm c0008000");
+		else
+			setenv("bootcmd", "nand read c0008000 40000 3c0000;bootm c0008000");	
+	}
+		
+/* samsung socs: no auto-detect devices */
+#elif defined(CONFIG_SMDK6400) || defined(CONFIG_SMDK2450) || defined(CONFIG_SMDK2416)
+
+#if defined(CONFIG_NAND)
+	puts("NAND:    ");
+	nand_init();		/* go init the NAND */
+#endif
+
+#if defined(CONFIG_ONENAND)
+	puts("OneNAND: ");
+	onenand_init();		/* go init the One-NAND */
+#endif
+
+#if defined(CONFIG_BOOT_MOVINAND)
+	puts("SD/MMC:  ");
+
+	if ((0x24564236 == magic[0]) && (0x20764316 == magic[1])) {
+		printf("Boot up for burning\n");
+	} else {
+		movi_set_capacity();
+		movi_set_ofs(MOVI_TOTAL_BLKCNT);
+		movi_init();
+	}
+#endif
+
+/* others */
+#else
 
 #if (CONFIG_COMMANDS & CFG_CMD_NAND)
-	puts ("NAND:  ");
+	puts ("NAND:    ");
 	nand_init();		/* go init the NAND */
+#endif
+
 #endif
 
 #ifdef CONFIG_HAS_DATAFLASH
@@ -389,7 +470,7 @@ void start_armboot (void)
 #endif
 #if (CONFIG_COMMANDS & CFG_CMD_NET)
 #if defined(CONFIG_NET_MULTI)
-	puts ("Net:   ");
+	puts ("Net:     ");
 #endif
 	eth_initialize(gd->bd);
 #endif

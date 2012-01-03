@@ -65,7 +65,7 @@ uchar (*env_get_char)(int) = env_get_char_init;
 #define XMK_STR(x)	#x
 #define MK_STR(x)	XMK_STR(x)
 
-uchar default_environment[] = {
+uchar default_environment[CFG_ENV_SIZE] = {
 #ifdef	CONFIG_BOOTARGS
 	"bootargs="	CONFIG_BOOTARGS			"\0"
 #endif
@@ -141,7 +141,7 @@ uchar default_environment[] = {
 	"\0"
 };
 
-#if defined(CFG_ENV_IS_IN_NAND)		/* Environment is in Nand Flash */
+#if defined(CFG_ENV_IS_IN_NAND) || defined(CFG_ENV_IS_IN_MOVINAND) || defined(CFG_ENV_IS_IN_ONENAND) || defined(CFG_ENV_IS_IN_AUTO) /* Environment is in Nand Flash or MoviNAND or OneNAND */
 int default_environment_size = sizeof(default_environment);
 #endif
 
